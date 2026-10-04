@@ -1,7 +1,7 @@
 name: hrrr
 on:
   schedule:
-    - cron: '25,55 * * * *'
+    - cron: '5,25,45 * * * *'   # GitHub cron is best-effort; frequent cheap checks keep the lag small
   workflow_dispatch:
 permissions:
   contents: write
@@ -21,10 +21,24 @@ jobs:
       - name: Latest published run
         id: pub
         run: echo "run=$(curl -fsS https://raw.githubusercontent.com/${{ github.repository }}/wx-data/meta.json?t=$(date +%s) | jq -r .run || echo none)" >> "$GITHUB_OUTPUT"
-      - run: pip install -r requirements.txt
+      - name: Newest complete HRRR run on AWS
+        id: aws
+        run: |
+          for back in 1 2 3 4 5; do
+            R=$(date -u -d "-$back hour" +%Y%m%d/conus/hrrr.t%Hz); ISO=$(date -u -d "-$back hour" +%Y-%m-%dT%H:00:00Z)
+            if curl -fsS -o /dev/null "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.${R}.wrfsfcf18.grib2.idx"; then echo "run=$ISO" >> "$GITHUB_OUTPUT"; exit 0; fi
+          done
+          echo "run=none" >> "$GITHUB_OUTPUT"
+      - name: Skip if already published
+        if: steps.aws.outputs.run == steps.pub.outputs.run
+        run: echo "run ${{ steps.aws.outputs.run }} already published"
+      - if: steps.aws.outputs.run != steps.pub.outputs.run
+        run: pip install -r requirements.txt
       - name: Render
+        if: steps.aws.outputs.run != steps.pub.outputs.run
         run: python hrrr_render.py out --hours 18
       - name: Publish
+        if: steps.aws.outputs.run != steps.pub.outputs.run
         run: |
           NEW=$(jq -r .run out/meta.json)
           if [ "$NEW" = "${{ steps.pub.outputs.run }}" ]; then echo "run $NEW already published"; exit 0; fi

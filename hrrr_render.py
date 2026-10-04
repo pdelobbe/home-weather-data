@@ -265,4 +265,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    # ecCodes' bundled eckit segfaults during interpreter teardown on Linux (exit 139)
+    # even after a clean run. All output is already flushed/renamed, so skip finalizers.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code or 0)

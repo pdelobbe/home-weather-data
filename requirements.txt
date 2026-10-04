@@ -1,0 +1,16 @@
+# HRRR renderer deps. CI runs ubuntu-latest + Python 3.12; every pin below has a
+# cp312 manylinux_2_28 x86_64 wheel (verified with `pip download --only-binary=:all:
+# --platform manylinux_2_28_x86_64 --python-version 3.12`).
+#
+# eccodes: on Linux the PyPI package is a pure-Python py3-none-any wheel that does NOT
+# contain libeccodes itself; its metadata declares `eccodeslib; platform_system != "Windows"`,
+# and the eccodeslib wheel bundles libeccodes.so (+ libaec, libopenjp2, libpng, and
+# eckitlib), which eccodes locates via findlibs. So no apt-get libeccodes-dev is needed.
+# (On Windows the eccodes wheel itself bundles eccodes.dll.) eccodeslib is pinned
+# explicitly so the binary library version matches the Python binding.
+eccodes==2.49.0
+eccodeslib==2.49.0.30; platform_system != "Windows"
+numpy==2.4.6
+scipy==1.17.1
+pillow==12.3.0
+pyproj==3.7.2

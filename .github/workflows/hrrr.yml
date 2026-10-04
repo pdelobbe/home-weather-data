@@ -1,0 +1,37 @@
+name: hrrr
+on:
+  schedule:
+    - cron: '25,55 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: hrrr
+  cancel-in-progress: false
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Latest published run
+        id: pub
+        run: echo "run=$(curl -fsS https://raw.githubusercontent.com/${{ github.repository }}/wx-data/meta.json?t=$(date +%s) | jq -r .run || echo none)" >> "$GITHUB_OUTPUT"
+      - run: pip install -r requirements.txt
+      - name: Render
+        run: python hrrr_render.py out --hours 18
+      - name: Publish
+        run: |
+          NEW=$(jq -r .run out/meta.json)
+          if [ "$NEW" = "${{ steps.pub.outputs.run }}" ]; then echo "run $NEW already published"; exit 0; fi
+          cd out
+          git init -q -b wx-data
+          git config user.name "hrrr-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "HRRR $NEW"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" wx-data

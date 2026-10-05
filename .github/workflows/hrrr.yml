@@ -1,51 +1,55 @@
 name: hrrr
+# A long-running watcher: polls NOAA every 2 minutes, renders a run as soon as it is complete,
+# and re-dispatches itself before the 6-hour job limit. The cron is only a backstop —
+# GitHub throttles schedules on small repos to every few hours.
 on:
   schedule:
-    - cron: '5,25,45 * * * *'   # GitHub cron is best-effort; frequent cheap checks keep the lag small
+    - cron: '7,37 * * * *'
   workflow_dispatch:
 permissions:
   contents: write
+  actions: write
 concurrency:
   group: hrrr
   cancel-in-progress: false
 jobs:
-  render:
+  watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 345
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
-      - name: Latest published run
-        id: pub
-        run: echo "run=$(curl -fsS https://raw.githubusercontent.com/${{ github.repository }}/wx-data/meta.json?t=$(date +%s) | jq -r .run || echo none)" >> "$GITHUB_OUTPUT"
-      - name: Newest complete HRRR run on AWS
-        id: aws
+      - run: pip install -r requirements.txt
+      - name: Watch and publish
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for back in 1 2 3 4 5; do
-            R=$(date -u -d "-$back hour" +%Y%m%d/conus/hrrr.t%Hz); ISO=$(date -u -d "-$back hour" +%Y-%m-%dT%H:00:00Z)
-            if curl -fsS -o /dev/null "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.${R}.wrfsfcf18.grib2.idx"; then echo "run=$ISO" >> "$GITHUB_OUTPUT"; exit 0; fi
+          LAST=$(curl -fsS "https://raw.githubusercontent.com/$REPO/wx-data/meta.json?t=$(date +%s)" | jq -r .run || echo none)
+          echo "published: $LAST"
+          END=$((SECONDS + 330*60))
+          while [ $SECONDS -lt $END ]; do
+            NEW=none
+            for back in 1 2 3 4 5; do
+              R=$(date -u -d "-$back hour" +%Y%m%d/conus/hrrr.t%Hz); ISO=$(date -u -d "-$back hour" +%Y-%m-%dT%H:00:00Z)
+              if curl -fsS -o /dev/null "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.${R}.wrfsfcf18.grib2.idx"; then NEW=$ISO; break; fi
+            done
+            if [ "$NEW" != none ] && [ "$NEW" != "$LAST" ]; then
+              echo "$(date -u +%H:%M:%S)Z new run $NEW — rendering"
+              if python hrrr_render.py out --hours 18; then
+                ( cd out && git init -q -b wx-data && git config user.name hrrr-bot && git config user.email "41898282+github-actions[bot]@users.noreply.github.com" \
+                  && git add -A && git commit -q -m "HRRR $NEW" \
+                  && git push -qf "https://x-access-token:${TOKEN}@github.com/${REPO}.git" wx-data ) && LAST=$NEW && echo "published $NEW"
+                rm -rf out/.git
+              fi
+            fi
+            sleep 120
           done
-          echo "run=none" >> "$GITHUB_OUTPUT"
-      - name: Skip if already published
-        if: steps.aws.outputs.run == steps.pub.outputs.run
-        run: echo "run ${{ steps.aws.outputs.run }} already published"
-      - if: steps.aws.outputs.run != steps.pub.outputs.run
-        run: pip install -r requirements.txt
-      - name: Render
-        if: steps.aws.outputs.run != steps.pub.outputs.run
-        run: python hrrr_render.py out --hours 18
-      - name: Publish
-        if: steps.aws.outputs.run != steps.pub.outputs.run
-        run: |
-          NEW=$(jq -r .run out/meta.json)
-          if [ "$NEW" = "${{ steps.pub.outputs.run }}" ]; then echo "run $NEW already published"; exit 0; fi
-          cd out
-          git init -q -b wx-data
-          git config user.name "hrrr-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -q -m "HRRR $NEW"
-          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" wx-data
+      - name: Chain the next watcher
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run hrrr.yml -R "${{ github.repository }}"

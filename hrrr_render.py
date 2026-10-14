@@ -6,9 +6,11 @@ and writes transparent PNGs + meta.json for Leaflet imageOverlay.
 
 Usage: python hrrr_render.py OUT_DIR [--hours 18] [--run YYYYMMDDHH]
 
-OUT_DIR/{refl,stp,uh} are cleared each run (only the current run is kept); meta.json is
-written last, atomically. A forecast hour that fails to download is retried twice; the
-run then stops at the last good hour (meta.hours), failing if fewer than 6 hours succeed.
+Incremental: NOAA posts forecast hours one at a time (~2 min apart), so each call renders
+only the hours that are new since OUT_DIR/meta.json (same run) and republishes with the
+higher meta.hours. A newer run (first hour posted) clears OUT_DIR and starts over at hour 1:
+frames from two runs are never mixed. meta.json is written last, atomically.
+Exit codes: 0 published, 3 nothing new, 1 error.
 """
 from __future__ import annotations
 
@@ -95,23 +97,56 @@ def url_for(run: dt.datetime, fh: int, ext: str = "") -> str:
     return f"{BUCKET}/hrrr.{run:%Y%m%d}/conus/hrrr.t{run:%H}z.wrfsfcf{fh:02d}.grib2{ext}"
 
 
-def run_complete(run: dt.datetime, hours: int) -> bool:
-    """NOAA uploads forecast hours one by one; only trust a run once every hour's index exists."""
-    for fh in range(1, hours + 1):
-        try:
-            fetch(url_for(run, fh, ".idx"))
-        except Exception:
-            return False
-    return True
+def idx_exists(run: dt.datetime, fh: int) -> bool:
+    try:
+        fetch(url_for(run, fh, ".idx"))
+        return True
+    except Exception:
+        return False
 
 
-def latest_run(hours: int) -> dt.datetime:
+def available_hours(run: dt.datetime, start: int, target: int) -> int:
+    """Highest contiguous forecast hour in start..target that NOAA has posted (start-1 if none)."""
+    last = start - 1
+    for fh in range(start, target + 1):
+        if not idx_exists(run, fh):
+            break
+        last = fh
+    return last
+
+
+def latest_run() -> dt.datetime:
+    """Newest run (last 5 hours) with at least its first forecast hour posted."""
     now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0, tzinfo=None)
     for back in range(1, 6):
         run = now - dt.timedelta(hours=back)
-        if run_complete(run, hours):
+        if idx_exists(run, 1):
             return run
-    raise SystemExit("no complete HRRR run found in the last 5 hours")
+    raise SystemExit("no HRRR run found in the last 5 hours")
+
+
+def run_iso(run: dt.datetime) -> str:
+    return run.strftime("%Y-%m-%dT%H:00:00Z")
+
+
+def read_meta(out: str) -> dict | None:
+    try:
+        with open(os.path.join(out, "meta.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def plan_start(meta: dict | None, run: str, target: int, have) -> int:
+    """First forecast hour to render. 1 restarts from scratch: no published run, a different run
+    (never mix two runs' frames), or published frames missing on disk. target+1 means up to date.
+    `have(fh)` reports whether hour fh's frames (and the UH state) are present."""
+    if not meta or meta.get("run") != run or not isinstance(meta.get("hours"), int):
+        return 1
+    done = min(meta["hours"], target)
+    if done < 1 or not all(have(fh) for fh in range(1, done + 1)):
+        return 1
+    return done + 1
 
 
 def byte_ranges(idx: str) -> dict[str, str]:
@@ -196,8 +231,21 @@ def main() -> int:
     ap.add_argument("--hours", type=int, default=18)
     ap.add_argument("--run")
     a = ap.parse_args()
-    run = dt.datetime.strptime(a.run, "%Y%m%d%H") if a.run else latest_run(a.hours)
+    run = dt.datetime.strptime(a.run, "%Y%m%d%H") if a.run else latest_run()
     print(f"run {run:%Y-%m-%d %HZ}", flush=True)
+
+    frame = lambda p, fh: os.path.join(a.out, p, f"f{fh:02d}.png")
+    uh_state = os.path.join(a.out, "uh_max.npz")
+    have = lambda fh: all(os.path.exists(frame(p, fh)) for p in ("refl", "stp", "uh")) and os.path.exists(uh_state)
+    start = plan_start(read_meta(a.out), run_iso(run), a.hours, have)
+    if start > a.hours:
+        print("up to date")
+        return 3
+    last = available_hours(run, start, a.hours)
+    if last < start:
+        print(f"waiting: f{start:02d} not posted yet ({start - 1} of {a.hours} published)")
+        return 3
+    print(f"rendering f{start:02d}..f{last:02d}", flush=True)
 
     def download_once(fh: int) -> dict[str, bytes]:
         rngs = byte_ranges(fetch(url_for(run, fh, ".idx")).decode())
@@ -212,13 +260,12 @@ def main() -> int:
 
     # Network in parallel; ecCodes is not thread-safe, so decode serially.
     with ThreadPoolExecutor(max_workers=6) as ex:
-        raw = list(ex.map(download, range(1, a.hours + 1)))
-    # Keep only the contiguous run of good hours; stop at the first failure.
+        raw = list(ex.map(download, range(start, last + 1)))
+    # Keep only the contiguous run of good hours; the rest are picked up next poll.
     if None in raw:
         raw = raw[:raw.index(None)]
-    # A partial run would publish a loop shorter than the rain strip; wait for the next poll instead.
-    if len(raw) < a.hours:
-        print(f"only {len(raw)} of {a.hours} forecast hours downloaded; not publishing", file=sys.stderr)
+    if not raw:
+        print("no forecast hour downloaded; not publishing", file=sys.stderr)
         return 1
     hours = []
     for msgs in raw:
@@ -231,13 +278,17 @@ def main() -> int:
     lin = lambda f: map_coordinates(f, [rows, cols], order=1, mode="nearest")
     near = lambda f: map_coordinates(f, [rows, cols], order=0, mode="nearest")
 
-    # Only the current run's frames: clear old product dirs so a longer previous run
-    # can't leave stale fNN.png files behind.
-    for p in ("refl", "stp", "uh"):
-        shutil.rmtree(os.path.join(a.out, p), ignore_errors=True)
-        os.makedirs(os.path.join(a.out, p))
-    uh_max = None
-    for fh, d in enumerate(hours, start=1):
+    if start == 1:
+        # A new run: clear every product dir so no frame from the previous run survives.
+        for p in ("refl", "stp", "uh"):
+            shutil.rmtree(os.path.join(a.out, p), ignore_errors=True)
+            os.makedirs(os.path.join(a.out, p))
+        if os.path.exists(uh_state):
+            os.remove(uh_state)
+        uh_max = None
+    else:
+        uh_max = np.load(uh_state)["uh"]  # run-max through the published hours
+    for fh, d in enumerate(hours, start=start):
         # Reflectivity + precip type
         refl = gaussian_filter(lin(d["refd"]), 1.0)
         snow, frzr, sleet = near(d["csnow"]) > 0, near(d["cfrzr"]) > 0, near(d["cicep"]) > 0
@@ -246,20 +297,21 @@ def main() -> int:
         for scale, m in ((SNOW, snow & ~frzr & ~sleet), (SLEET, sleet & ~frzr), (FRZR, frzr)):
             layer = colorize(refl, scale, m)
             img[layer[..., 3] > 0] = layer[layer[..., 3] > 0]
-        Image.fromarray(img).save(os.path.join(a.out, "refl", f"f{fh:02d}.png"), optimize=True)
+        Image.fromarray(img).save(frame("refl", fh), optimize=True)
         # STP
         shr6 = np.hypot(d["ushr6"], d["vshr6"])
         stp = stp_fixed(d["cape"], d["cin"], d["srh1"], shr6, d["t2"], d["td2"])
         stp = gaussian_filter(lin(stp), 1.0)
         Image.fromarray(colorize(stp, STP, alpha=200)).save(
-            os.path.join(a.out, "stp", f"f{fh:02d}.png"), optimize=True)
+            frame("stp", fh), optimize=True)
         # UH 2-5 km, running max through this hour
         uh_max = d["uh25"] if uh_max is None else np.maximum(uh_max, d["uh25"])
         Image.fromarray(colorize_smooth(lin(uh_max), UH_STOPS, UH_ALPHA)).save(
-            os.path.join(a.out, "uh", f"f{fh:02d}.png"), optimize=True)
+            frame("uh", fh), optimize=True)
         print(f"  f{fh:02d} done", flush=True)
 
-    meta = {"run": run.strftime("%Y-%m-%dT%H:00:00Z"), "hours": len(hours),
+    np.savez_compressed(uh_state, uh=uh_max.astype(np.float32))
+    meta = {"run": run_iso(run), "hours": start - 1 + len(hours), "expected": a.hours,
             "bounds": [[SOUTH, WEST], [NORTH, EAST]], "width": WIDTH, "height": height,
             "generated": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     # meta.json last and atomically, so a reader never sees meta pointing at missing frames.

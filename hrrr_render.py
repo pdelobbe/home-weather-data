@@ -95,15 +95,22 @@ def url_for(run: dt.datetime, fh: int, ext: str = "") -> str:
     return f"{BUCKET}/hrrr.{run:%Y%m%d}/conus/hrrr.t{run:%H}z.wrfsfcf{fh:02d}.grib2{ext}"
 
 
+def run_complete(run: dt.datetime, hours: int) -> bool:
+    """NOAA uploads forecast hours one by one; only trust a run once every hour's index exists."""
+    for fh in range(1, hours + 1):
+        try:
+            fetch(url_for(run, fh, ".idx"))
+        except Exception:
+            return False
+    return True
+
+
 def latest_run(hours: int) -> dt.datetime:
     now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0, tzinfo=None)
     for back in range(1, 6):
         run = now - dt.timedelta(hours=back)
-        try:
-            fetch(url_for(run, hours, ".idx"))
+        if run_complete(run, hours):
             return run
-        except Exception:
-            continue
     raise SystemExit("no complete HRRR run found in the last 5 hours")
 
 
@@ -209,9 +216,9 @@ def main() -> int:
     # Keep only the contiguous run of good hours; stop at the first failure.
     if None in raw:
         raw = raw[:raw.index(None)]
-    min_hours = min(MIN_HOURS, a.hours)
-    if len(raw) < min_hours:
-        print(f"only {len(raw)} forecast hours downloaded (need {min_hours})", file=sys.stderr)
+    # A partial run would publish a loop shorter than the rain strip; wait for the next poll instead.
+    if len(raw) < a.hours:
+        print(f"only {len(raw)} of {a.hours} forecast hours downloaded; not publishing", file=sys.stderr)
         return 1
     hours = []
     for msgs in raw:

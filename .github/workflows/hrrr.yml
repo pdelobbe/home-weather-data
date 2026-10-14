@@ -35,7 +35,9 @@ jobs:
             NEW=none
             for back in 1 2 3 4 5; do
               R=$(date -u -d "-$back hour" +%Y%m%d/conus/hrrr.t%Hz); ISO=$(date -u -d "-$back hour" +%Y-%m-%dT%H:00:00Z)
-              if curl -fsS -o /dev/null "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.${R}.wrfsfcf18.grib2.idx"; then NEW=$ISO; break; fi
+              # NOAA uploads hours one at a time; require every hour 1..18 before calling the run complete.
+              OK=1; for fh in $(seq -w 1 18); do curl -fsS -o /dev/null "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.${R}.wrfsfcf${fh}.grib2.idx" || { OK=0; break; }; done
+              if [ $OK = 1 ]; then NEW=$ISO; break; fi
             done
             if [ "$NEW" != none ] && [ "$NEW" != "$LAST" ]; then
               echo "$(date -u +%H:%M:%S)Z new run $NEW — rendering"

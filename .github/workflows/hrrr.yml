@@ -28,6 +28,7 @@ jobs:
         env:
           REPO: ${{ github.repository }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUSH_SECRET: ${{ secrets.PUSH_SECRET }}
         run: |
           # Start from what is published so a fresh job continues the current run instead of re-rendering it.
           rm -rf out
@@ -45,6 +46,11 @@ jobs:
               rm -rf out/.git
             elif [ $RC != 3 ]; then
               echo "$(date -u +%H:%M:%S)Z render failed (exit $RC)"
+            fi
+            # Push alerts for the app: its function checks NWS alerts and the rain gauge and sends anything new.
+            if [ -n "$PUSH_SECRET" ]; then
+              curl -fsS -m 25 -X POST -H "x-push-secret: $PUSH_SECRET" "https://home-weather-blond.vercel.app/api/push?check=1" | head -c 200 || echo "push check failed"
+              echo
             fi
             sleep 120
           done
